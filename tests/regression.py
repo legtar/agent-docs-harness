@@ -110,6 +110,54 @@ class Regression(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0)
         self.assertFalse(dst.exists())
 
+    def test_pdf_replace_keeps_unrelated_text(self):
+        """Redaction must not take neighbouring runs with it: a page number in a second face stays."""
+        src, dst = OUT/"collateral.pdf", OUT/"collateral.edited.pdf"
+        dst.unlink(missing_ok=True)
+        doc = fitz.open(); page = doc.new_page()
+        page.insert_text((50, 80), "ReplaceMe", fontsize=12)
+        page.insert_text((50, 780), "Page 1 of 1", fontsize=9, fontname="hebo")  # bold face, no Cyrillic
+        doc.save(src); doc.close()
+        r = subprocess.run([sys.executable, str(ROOT/"tools/pdf_edit.py"), str(src), str(dst),
+                            "--replace", "ReplaceMe", "Changed"], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        with fitz.open(dst) as d:
+            text = d[0].get_text()
+        self.assertIn("Changed", text)
+        self.assertIn("Page 1 of 1", text)
+
+    def test_pdf_replace_uses_system_font_when_subset_lacks_glyphs(self):
+        """A subset without Cyrillic is not a dead end: the same family from the system is embedded."""
+        src, dst = OUT/"subset.pdf", OUT/"subset.edited.pdf"
+        dst.unlink(missing_ok=True)
+        doc = fitz.open(); page = doc.new_page()
+        page.insert_text((50, 80), "Ivanov Ivanovich", fontsize=12)  # embeds a Latin-only subset
+        doc.save(src, garbage=4, deflate=True); doc.close()
+        r = subprocess.run([sys.executable, str(ROOT/"tools/pdf_edit.py"), str(src), str(dst),
+                            "--replace", "Ivanov Ivanovich", "Халикова Галия"], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("system:", r.stdout)  # the subset could not be used, the system family was
+        with fitz.open(dst) as d:
+            self.assertIn("Халикова Галия", d[0].get_text())
+
+    def test_pdf_replace_grows_right_aligned_text_leftwards(self):
+        """A wider number may grow into the free space left of a right-aligned column edge."""
+        src, dst = OUT/"grow.pdf", OUT/"grow.edited.pdf"
+        dst.unlink(missing_ok=True)
+        doc = fitz.open(); page = doc.new_page()
+        page.insert_text((50, 80), "Balance", fontsize=10)
+        page.insert_text((300, 80), "300,85", fontsize=10)
+        page.insert_text((50, 100), "Balance", fontsize=10)
+        page.insert_text((300, 100), "300,85", fontsize=10)
+        doc.save(src); doc.close()
+        r = subprocess.run([sys.executable, str(ROOT/"tools/pdf_edit.py"), str(src), str(dst),
+                            "--replace", "300,85", "500 000,00", "2"], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        with fitz.open(dst) as d:
+            right = [w[2] for w in d[0].get_text("words") if w[4] == "500"]
+        self.assertEqual(len(right), 2)
+        self.assertAlmostEqual(right[0], right[1], delta=1.0)  # still flush right
+
     def test_stale_render_is_not_used(self):
         import render
         with tempfile.TemporaryDirectory() as d:
