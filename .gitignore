@@ -1,0 +1,9 @@
+out/
+__pycache__/
+*.pyc
+~$*.docx
+.env
+.env.*
+%SystemDrive%/
+SESSION_LOG.md
+CHANGES-*.md
