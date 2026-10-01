@@ -82,12 +82,49 @@ def runs_of(p):
     return out
 
 
+
+_FIELD_CACHE = None
+
+def protected_field_runs(p):
+    """Field instructions/results are generated content, including fields spanning paragraphs."""
+    root = p.getroottree().getroot()
+    if _FIELD_CACHE is not None and root in _FIELD_CACHE:
+        return _FIELD_CACHE[root]
+    protected, depth = set(), 0
+    for r in root.iter(q("r")):
+        ancestors = {a.tag for a in r.iterancestors()}
+        if ancestors & {q("del"), q("moveFrom")}:
+            continue
+        markers = r.findall(q("fldChar"))
+        if depth or markers or q("fldSimple") in ancestors:
+            protected.add(r)
+        for marker in markers:
+            kind = marker.get(q("fldCharType"))
+            if kind == "begin": depth += 1
+            elif kind == "end": depth = max(0, depth - 1)
+    if _FIELD_CACHE is not None:
+        _FIELD_CACHE[root] = protected
+    return protected
+
+
+def revision_guard(r, ed):
+    if ed.author and any(a.tag in (q("ins"), q("moveTo")) and a.get(q("id")) not in ed.created_ids for a in r.iterancestors()):
+        raise OpError("tracked editing inside an existing insertion/move revision is unsupported; resolve the previous revision first")
+
+
+def section_guard(seg, op):
+    if not op.get("allow_section_change", False) and any(list(b.iter(q("sectPr"))) for b in seg):
+        raise OpError("range contains a section boundary; use allow_section_change=true only for an intentional section-layout change")
+
+
 def model(p):
     """Paragraph text + list of (start, end, run). Non-simple runs become OPAQUE chars."""
     text, spans = "", []
+    protected = protected_field_runs(p)
     for r in runs_of(p):
-        t = "".join(x.text or "" for x in r.findall(q("t"))) if simple(r) else OPAQUE
-        spans.append((len(text), len(text) + len(t), r, simple(r)))
+        editable = simple(r) and r not in protected
+        t = "".join(x.text or "" for x in r.findall(q("t"))) if editable else OPAQUE
+        spans.append((len(text), len(text) + len(t), r, editable))
         text += t
     return text, spans
 
@@ -115,15 +152,23 @@ class Editor:
         self.author = author
         self.date = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         self.next_id = 900000
+        self.created_ids = set()
 
     def rev(self):
         self.next_id += 1
+        self.created_ids.add(str(self.next_id))
         return {q("id"): str(self.next_id), q("author"): self.author, q("date"): self.date}
 
     def kill_run(self, r):
         """Remove a run, or mark it deleted when tracking."""
         if not self.author:
             r.getparent().remove(r)
+            return
+        revision_guard(r, self)
+        owned = next((a for a in r.iterancestors() if a.tag == q("ins") and a.get(q("id")) in self.created_ids), None)
+        if owned is not None:
+            r.getparent().remove(r)
+            if not len(owned): owned.getparent().remove(owned)
             return
         d = etree.Element(q("del"), self.rev())
         r.addprevious(d)
@@ -135,6 +180,9 @@ class Editor:
 
     def wrap_ins(self, r):
         if self.author:
+            revision_guard(r, self)
+            if any(a.tag == q("ins") and a.get(q("id")) in self.created_ids for a in r.iterancestors()):
+                return
             w = etree.Element(q("ins"), self.rev())
             r.addprevious(w)
             w.append(r)
@@ -160,6 +208,7 @@ class Editor:
         if not cands:
             raise OpError("insertion point is next to a tab/field/image; widen the find text")
         s0, e0, r = cands[0]
+        revision_guard(r, self)
         if s0 == start:  # at paragraph start: format of the following run, placed before it
             nr = copy.deepcopy(r); set_text(nr, new); r.addprevious(nr)
         else:
@@ -170,10 +219,17 @@ class Editor:
 
     def apply(self, p, start, end, new):
         _, spans = model(p)
+        targets = [r for s, e, r, ok in spans if s != e and e > start and s < end]
+        owners = [next((a for a in r.iterancestors() if a.tag == q("ins") and a.get(q("id")) in self.created_ids), None) for r in targets]
+        if self.author and any(a is not None for a in owners):
+            if all(a is not None for a in owners):
+                return Editor().apply(p, start, end, new)
+            raise OpError("replacement crosses original text and an insertion created earlier in this batch; split the edit")
         hit = []
         for s0, e0, r, ok in spans:
             if e0 <= start or s0 >= end or s0 == e0:
                 continue
+            revision_guard(r, self)
             if s0 < start:
                 r = split(r, start - s0)
                 s0 = start
@@ -349,6 +405,10 @@ def track_new_block(b, ed):
 
 
 def remove_block(b, ed):
+    inserted_mark = b.find(f"{q('pPr')}/{q('rPr')}/{q('ins')}")
+    if ed.author and inserted_mark is not None and inserted_mark.get(q("id")) in ed.created_ids:
+        b.getparent().remove(b)
+        return
     if not ed.author:
         b.getparent().remove(b)
         return
@@ -397,6 +457,8 @@ def list_tables(root):
 
 def get_table(root, sel):
     tbls = list(root.iter(q("tbl")))
+    if isinstance(sel, bool):
+        raise OpError("table index cannot be boolean")
     if isinstance(sel, int) or (isinstance(sel, str) and sel.lstrip("-").isdigit()):
         ti = int(sel)
         if not 0 <= ti < len(tbls):
@@ -410,9 +472,17 @@ def get_table(root, sel):
     return hits[0]
 
 
+def index_value(value, name):
+    if type(value) is int:
+        return value
+    if isinstance(value, str) and re.fullmatch(r"-?\d+", value):
+        return int(value)
+    raise OpError(f"{name} must be an integer index")
+
+
 def get_row(tbl, ri):
     rows = tbl.findall(q("tr"))
-    ri = int(ri)
+    ri = index_value(ri, "row")
     if not -len(rows) <= ri < len(rows):
         raise OpError(f"no row {ri} (have {len(rows)})")
     return rows[ri]
@@ -434,8 +504,12 @@ def set_para_text(p, text, ed: Editor, rpr=None, extra=()):
     """Replace the text of paragraph p (and wipe text of `extra` paragraphs), keeping paragraph
     props and the first text run's formatting. Images/fields-only runs are left alone."""
     rpr = rpr if rpr is not None else first_rpr(p)
+    protected = protected_field_runs(p)
     for para in (p, *extra):
         for r in runs_of(para):
+            if r in protected:
+                continue
+            revision_guard(r, ed)
             if simple(r):
                 ed.kill_run(r)
             elif r.find(q("t")) is not None:
@@ -461,12 +535,19 @@ def set_cell(tc, text, ed: Editor):
     set_para_text(paras[0], text, ed, rpr, paras[1:])
     if not ed.author:
         for p in paras[1:]:
-            tc.remove(p)
+            if all(child.tag == q("pPr") for child in p):
+                tc.remove(p)
 
 
 def add_row(tbl, after, values, ed: Editor):
     """Clone row `after` (formatting, borders, merges) below itself and fill it."""
     src = get_row(tbl, after)
+    rows = tbl.findall(q("tr"))
+    index = rows.index(src)
+    if index + 1 < len(rows) and any(tc.find(f"{q('tcPr')}/{q('vMerge')}") is not None and tc.find(f"{q('tcPr')}/{q('vMerge')}").get(q("val")) != "restart" for tc in rows[index + 1].findall(q("tc"))):
+        raise OpError("add_row: insertion inside a vertical merge would break its chain; insert after the merged region")
+    if any(list(src.iter(q(tag))) for tag in ("drawing", "pict", "footnoteReference", "endnoteReference")):
+        raise OpError("add_row: cloning objects or footnote/endnote references is unsupported")
     tr = fresh(copy.deepcopy(src))
     for e in list(tr.iter(q("tblHeader"))):  # a cloned header row must not become a repeating header
         e.getparent().remove(e)
@@ -489,9 +570,60 @@ def add_row(tbl, after, values, ed: Editor):
     return tr
 
 
+
+def row_grid_cells(tr):
+    """Physical cells with their grid start and span (horizontal merges and gridBefore)."""
+    before = tr.find(f"{q('trPr')}/{q('gridBefore')}")
+    start = int(before.get(q("val"))) if before is not None else 0
+    cells = []
+    for tc in tr.findall(q("tc")):
+        span = tc.find(f"{q('tcPr')}/{q('gridSpan')}")
+        width = int(span.get(q("val"))) if span is not None else 1
+        cells.append((start, width, tc)); start += width
+    return cells
+
+
+def vertical_source(tbl, tr, tc):
+    merge = tc.find(f"{q('tcPr')}/{q('vMerge')}")
+    if merge is None or merge.get(q("val")) == "restart":
+        return tc
+    start, span, _ = next(c for c in row_grid_cells(tr) if c[2] is tc)
+    rows = tbl.findall(q("tr"))
+    for prev in reversed(rows[:rows.index(tr)]):
+        match = next((c for c in row_grid_cells(prev) if c[:2] == (start, span)), None)
+        if match is None:
+            break
+        candidate = match[2]
+        marker = candidate.find(f"{q('tcPr')}/{q('vMerge')}")
+        if marker is None:
+            break
+        if marker.get(q("val")) == "restart":
+            return candidate
+    raise OpError("vertical merge has no matching restart cell")
+
+
 def del_row(tbl, ri, ed: Editor):
     tr = get_row(tbl, ri)
+    if ed.author and list(tr.iter(q("vMerge"))):
+        raise OpError("tracked deletion of vertically merged rows is unsupported; use an untracked copy")
     if not ed.author:
+        rows = tbl.findall(q("tr")); index = rows.index(tr)
+        if index + 1 < len(rows):
+            following = row_grid_cells(rows[index + 1])
+            transfers = []
+            for start, span, tc in row_grid_cells(tr):
+                marker = tc.find(f"{q('tcPr')}/{q('vMerge')}")
+                if marker is not None and marker.get(q("val")) == "restart":
+                    match = next((c[2] for c in following if c[:2] == (start, span)), None)
+                    continuation = match.find(f"{q('tcPr')}/{q('vMerge')}") if match is not None else None
+                    if continuation is not None and continuation.get(q("val")) != "restart":
+                        transfers.append((tc, match, continuation))
+            for tc, match, continuation in transfers:
+                continuation.set(q("val"), "restart")
+                for child in list(match):
+                    if child.tag != q("tcPr"): match.remove(child)
+                for child in list(tc):
+                    if child.tag != q("tcPr"): match.append(child)
         tbl.remove(tr)
         return
     trPr(tr).append(etree.Element(q("del"), ed.rev()))
@@ -504,7 +636,7 @@ def del_row(tbl, ri, ed: Editor):
 def table_like(like, rows):
     """New table cloned from an existing one: same tblPr/grid/borders; header row from its
     first row, body rows from its second row."""
-    if like.find(".//" + q("drawing")) is not None or like.find(".//" + q("pict")) is not None or any(t is not like for t in like.iter(q("tbl"))):
+    if any(list(like.iter(q(tag))) for tag in ("drawing", "pict", "footnoteReference", "endnoteReference")) or any(t is not like for t in like.iter(q("tbl"))):
         raise OpError("insert_table: template contains drawings or nested tables; choose a plain table")
     rws = like.findall(q("tr"))
     ncol = len(rws[0].findall(q("tc")))
@@ -531,13 +663,36 @@ def table_like(like, rows):
     return t
 
 
-def table_plain(body, rows):
+def section_for(body, block):
+    top = block
+    while top.getparent() is not body:
+        top = top.getparent()
+    for b in list(body)[list(body).index(top):]:
+        if b.tag == q("sectPr"):
+            return b
+        section = b.find(f"{q('pPr')}/{q('sectPr')}")
+        if section is not None:
+            return section
+    return body.find(q("sectPr"))
+
+
+def table_plain(body, rows, section=None):
     """No template table in the document: booktabs table at full text width (house style)."""
     sys.path.insert(0, str(pathlib.Path(__file__).parent))
     from docx_kit import TOKENS, is_num
-    sect = body.find(q("sectPr"))
+    sect = section if section is not None else body.find(q("sectPr"))
     pg, mar = sect.find(q("pgSz")), sect.find(q("pgMar"))
-    width = int(pg.get(q("w"))) - int(mar.get(q("left"))) - int(mar.get(q("right")))
+    width = (int(pg.get(q("w"), "12240")) if pg is not None else 12240) - (int(mar.get(q("left"), "1440")) if mar is not None else 1440) - (int(mar.get(q("right"), "1440")) if mar is not None else 1440)
+    cols = sect.find(q("cols"))
+    if cols is not None:
+        individual = [int(c.get(q("w"))) for c in cols.findall(q("col")) if c.get(q("w"))]
+        number = int(cols.get(q("num"), "1"))
+        if individual:
+            width = min(individual)
+        elif number > 1:
+            width = (width - (number - 1) * int(cols.get(q("space"), "720"))) // number
+    if width <= 0:
+        raise OpError("section has no usable table width")
     ncol = len(rows[0])
     colw = [width // ncol] * ncol
     colw[-1] += width - sum(colw)
@@ -597,6 +752,8 @@ def validate_op(op):
         count = op.get("count", 1)
         if type(count) is not int or count < 1:
             raise OpError("count must be a positive integer")
+    if "allow_section_change" in op and type(op["allow_section_change"]) is not bool:
+        raise OpError("allow_section_change must be a boolean")
     for key in ("text",):
         if key in op and not isinstance(op[key], str):
             raise OpError(f"{key} must be a string")
@@ -656,6 +813,28 @@ def resize_image(root, op, ed):
             maxh = (int(pg.get(q("h"))) - int(mar.get(q("top"))) - int(mar.get(q("bottom")))) * 635
             if nw > maxw or nh > maxh:
                 raise OpError("drawing exceeds section text area")
+    if nw < 1 or nh < 1:
+        raise OpError("drawing dimensions round to zero")
+    for ancestor in frame.iterancestors():
+        if ancestor.tag == q("tc"):
+            cellw = ancestor.find(f"{q('tcPr')}/{q('tcW')}")
+            if cellw is not None and cellw.get(q("type"), "dxa") == "dxa":
+                limit = int(cellw.get(q("w"))) * 635
+                if nw > limit:
+                    raise OpError("drawing exceeds table cell width")
+    if sect is not None:
+        cols = sect.find(q("cols"))
+        if cols is not None:
+            explicit = [int(c.get(q("w"))) * 635 for c in cols.findall(q("col")) if c.get(q("w"))]
+            num = int(cols.get(q("num"), "1"))
+            if explicit:
+                limit = min(explicit)
+            elif num > 1 and pg is not None and mar is not None:
+                limit = (maxw - (num - 1) * int(cols.get(q("space"), "720")) * 635) / num
+            else:
+                limit = nw
+            if nw > limit:
+                raise OpError("drawing exceeds section column width")
     ext.set("cx", str(nw)); ext.set("cy", str(nh))
     for x in frame.xpath(".//a:xfrm/a:ext", namespaces={"a": A}):
         x.set("cx", str(nw)); x.set("cy", str(nh))
@@ -663,10 +842,22 @@ def resize_image(root, op, ed):
 
 # ---------- op executor ----------
 def run_ops(ops, trees, ed, smap, changed):
+    global _FIELD_CACHE
+    previous = _FIELD_CACHE
+    try:
+        return _run_ops(ops, trees, ed, smap, changed)
+    finally:
+        _FIELD_CACHE = previous
+
+
+def _run_ops(ops, trees, ed, smap, changed):
+    global _FIELD_CACHE
     body = trees["word/document.xml"].find(q("body"))
     if not isinstance(ops, list) or not all(isinstance(op, dict) for op in ops):
         raise OpError("ops must be a JSON list of objects")
     for n, op in enumerate(ops, 1):
+        # Field nodes are immutable during text edits; rebuild between structural ops.
+        _FIELD_CACHE = {}
         kind = op.get("op", "replace")
         tag = f"op {n} ({kind})"
         try:
@@ -709,11 +900,14 @@ def run_ops(ops, trees, ed, smap, changed):
                 if not isinstance(rows, list) or not rows or not isinstance(rows[0], list) or not rows[0] or any(not isinstance(r, list) or len(r) != len(rows[0]) for r in rows):
                     raise OpError("rows must be a nonempty rectangular list")
                 like = get_table(trees["word/document.xml"], op["like"]) if op.get("like") is not None else None
-                t = table_like(like, rows) if like is not None else table_plain(body, rows)
+                anchor = find_block(body, op.get("after", op.get("before")), "anchor")
+                t = table_like(like, rows) if like is not None else table_plain(body, rows, section_for(body, anchor))
                 place(body, t, op)
                 track_new_block(t, ed)
             elif kind == "delete":
-                for b in block_range(body, op):
+                seg = block_range(body, op)
+                section_guard(seg, op)
+                for b in seg:
                     remove_block(b, ed)
             elif kind == "delete_section":
                 h = find_block(body, op["heading"], "heading")
@@ -725,10 +919,12 @@ def run_ops(ops, trees, ed, smap, changed):
                 j = i + 1
                 while j < len(bl) and not (level(bl[j], smap) is not None and level(bl[j], smap) <= lv):
                     j += 1
+                section_guard(bl[i:j], op)
                 for b in bl[i:j]:
                     remove_block(b, ed)
             elif kind == "move":
                 seg = block_range(body, op)
+                section_guard(seg, op)
                 anchor = find_block(body, op.get("after", op.get("before")), "anchor")
                 if anchor in seg:
                     raise OpError("move: anchor is inside the moved range")
@@ -755,11 +951,13 @@ def run_ops(ops, trees, ed, smap, changed):
                     lead = [c for c in pPr if c.tag in (q("pStyle"), q("keepNext"), q("keepLines"))]
                     (lead[-1].addnext if lead else lambda e: pPr.insert(0, e))(pb)
             elif kind == "cell":
-                cells = get_row(get_table(trees["word/document.xml"], op["table"]), op["row"]).findall(q("tc"))
-                c = int(op["col"])
+                tbl = get_table(trees["word/document.xml"], op["table"])
+                tr = get_row(tbl, op["row"])
+                cells = tr.findall(q("tc"))
+                c = index_value(op["col"], "col")
                 if not 0 <= c < len(cells):
                     raise OpError(f"no cell {c} (row has {len(cells)})")
-                set_cell(cells[c], op["text"], ed)
+                set_cell(vertical_source(tbl, tr, cells[c]), op["text"], ed)
             elif kind == "add_row":
                 add_row(get_table(trees["word/document.xml"], op["table"]), op.get("after", -1), op["values"], ed)
             elif kind == "del_row":
@@ -890,4 +1088,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except (OpError, OSError, ValueError, zipfile.BadZipFile, etree.XMLSyntaxError) as exc:
+        print(f"ERROR {exc}; nothing published")
+        sys.exit(1)

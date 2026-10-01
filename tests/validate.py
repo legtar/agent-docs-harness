@@ -42,6 +42,10 @@ def check(cond, msg):
         fails.append(msg)
 
 
+# Fast behavioral checks cover adversarial cases before the long rendering run.
+tool("tests/regression.py")
+tool("tests/torture.py")
+
 P = [
     "Компания продолжила реализацию стратегии, утверждённой советом директоров в начале года. "
     "Ключевые инициативы — расширение продуктовой линейки, выход в новые регионы и повышение "

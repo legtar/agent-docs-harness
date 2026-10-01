@@ -27,6 +27,9 @@ def require_empty(page, rect):
     objects = [fitz.Rect(b[:4]) for b in page.get_text("blocks")]
     objects += [fitz.Rect(x["bbox"]) for x in page.get_image_info()]
     objects += [x["rect"] for x in page.get_drawings()]
+    objects += [w.rect for w in page.widgets() or []]
+    objects += [a.rect for a in page.annots() or []]
+    objects += [link["from"] for link in page.get_links()]
     if any(rect.intersects(r) for r in objects):
         raise ValueError("target overlaps existing content; edit the source or choose empty space")
 

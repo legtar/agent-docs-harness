@@ -16,6 +16,7 @@ text column, header rows repeat, rows never split across pages, no hyphenation (
 dependent), body left-aligned (justification reflows differently in Word vs LibreOffice).
 """
 import pathlib
+import math
 import re
 import shutil
 import subprocess
@@ -250,9 +251,19 @@ def is_num(s: str) -> bool:
     return bool(s.strip()) and bool(NUM.match(s.strip()))
 
 
+
+def validate_widths(widths, ncols):
+    if widths is not None and (not isinstance(widths, (list, tuple)) or len(widths) != ncols or any(type(w) not in (int, float) or not math.isfinite(w) or w <= 0 for w in widths)):
+        raise ValueError("widths must contain one finite positive weight per column")
+
+
 def polish_table(tbl, width_dxa, widths=None, header=True):
     """Fixed layout at full column width, repeat header, rows don't split, numbers right."""
     t = tbl._tbl
+    ncols = len(t.tblGrid.findall(qn("w:gridCol")))
+    validate_widths(widths, ncols)
+    if width_dxa <= 0:
+        raise ValueError("table width must be positive")
     tblPr = t.tblPr
     _set(tblPr, "w:tblW", **{"w:w": width_dxa, "w:type": "dxa"})
     _set(tblPr, "w:tblLayout", **{"w:type": "fixed"})
@@ -266,6 +277,8 @@ def polish_table(tbl, width_dxa, widths=None, header=True):
         lens = [min(max(n, 4), 40) for n in lens]
         cols = [int(width_dxa * n / sum(lens)) for n in lens]
     cols[-1] += width_dxa - sum(cols)
+    if any(w < 1 for w in cols):
+        raise ValueError("column weights produce a zero-width column")
     for g, w in zip(t.tblGrid.findall(qn("w:gridCol")), cols):
         g.set(qn("w:w"), str(w))
     # Direct borders, not table-style conditionals: identical in Word, LibreOffice, Google Docs.
@@ -288,9 +301,17 @@ def polish_table(tbl, width_dxa, widths=None, header=True):
         _set(trPr, "w:cantSplit")
         if header and ri == 0:
             _set(trPr, "w:tblHeader")
-        for ci, cell in enumerate(row.cells[:ncols]):
+        before = row._tr.find(f"{qn('w:trPr')}/{qn('w:gridBefore')}")
+        ci = int(before.get(qn("w:val"))) if before is not None else 0
+        from docx.table import _Cell
+        for tc in row._tr.findall(qn("w:tc")):
+            cell = _Cell(tc, tbl)
             tcPr = cell._tc.get_or_add_tcPr()
-            _set(tcPr, "w:tcW", **{"w:w": cols[min(ci, ncols - 1)], "w:type": "dxa"})
+            gs = tcPr.find(qn("w:gridSpan"))
+            span = int(gs.get(qn("w:val"))) if gs is not None else 1
+            if ci + span > ncols:
+                raise ValueError("merged cell exceeds table grid")
+            _set(tcPr, "w:tcW", **{"w:w": sum(cols[ci:ci + span]), "w:type": "dxa"})
             if header and ri == 0:
                 bd = _set(tcPr, "w:tcBorders")
                 bd.append(_el("w:bottom", **{"w:val": "single", "w:sz": 6, "w:space": 0, "w:color": T["ink"]}))
@@ -307,11 +328,15 @@ def polish_table(tbl, width_dxa, widths=None, header=True):
                     for r in p.runs:
                         r.bold = True
                         r.font.size = Pt(T["body_size"] - 1.5)
+            ci += span
     return tbl
 
 
 def add_table(doc, rows, widths=None, caption=None, header=True):
     """rows: list of lists of str. widths: relative column weights."""
+    if not isinstance(rows, (list, tuple)) or not rows or not isinstance(rows[0], (list, tuple)) or not rows[0] or any(not isinstance(row, (list, tuple)) or len(row) != len(rows[0]) for row in rows):
+        raise ValueError("rows must be a nonempty rectangular table; no values may be discarded")
+    validate_widths(widths, len(rows[0]))
     if caption:
         doc.add_paragraph(caption, style="Table Caption")
     tbl = doc.add_table(rows=len(rows), cols=len(rows[0]))

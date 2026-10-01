@@ -9,6 +9,7 @@ import pathlib
 import subprocess
 import sys
 import time
+import uuid
 
 import uno
 from com.sun.star.beans import PropertyValue
@@ -21,10 +22,11 @@ def prop(n, v):
 
 def main(src, dst, profile):
     office = pathlib.Path(sys.executable).parent / "soffice.exe"
-    pipe = f"lo_export_{int(time.time() * 1000)}"
+    pipe = f"lo_export_{uuid.uuid4().hex}"
     proc = subprocess.Popen([str(office), f"-env:UserInstallation={pathlib.Path(profile).as_uri()}",
                              "--headless", "--invisible", "--norestore", "--nologo",
                              f"--accept=pipe,name={pipe};urp;"])
+    desktop, doc = None, None
     try:
         resolver = uno.getComponentContext().ServiceManager.createInstanceWithContext(
             "com.sun.star.bridge.UnoUrlResolver", uno.getComponentContext())
@@ -39,6 +41,8 @@ def main(src, dst, profile):
         desktop = ctx.ServiceManager.createInstanceWithContext("com.sun.star.frame.Desktop", ctx)
         doc = desktop.loadComponentFromURL(pathlib.Path(src).resolve().as_uri(), "_blank", 0,
                                            (prop("Hidden", True), prop("ReadOnly", True)))
+        if doc is None:
+            raise RuntimeError(f"LibreOffice could not load {src}")
         if hasattr(doc, "getDocumentIndexes"):
             idx = doc.getDocumentIndexes()
             for _ in range(2):  # 2nd pass: TOC page numbers settle after the TOC itself takes space
@@ -51,14 +55,21 @@ def main(src, dst, profile):
         except Exception:  # LO sometimes drops the bridge on close; the PDF is already written
             pass
     finally:
+        if doc is not None:
+            try:
+                doc.close(True)
+            except Exception:
+                pass
         try:
-            desktop.terminate()
+            if desktop is not None:
+                desktop.terminate()
         except Exception:
             pass
         try:
             proc.wait(timeout=20)
         except subprocess.TimeoutExpired:
             proc.kill()
+            proc.wait(timeout=10)
 
 
 if __name__ == "__main__":

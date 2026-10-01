@@ -18,6 +18,7 @@ import difflib
 import pathlib
 import re
 import sys
+import uuid
 import zipfile
 
 import fitz
@@ -95,6 +96,11 @@ def text_margins(doc) -> tuple[float, float, float, float]:
     return xs0[len(xs0) // 20], xs1[-1 - len(xs1) // 20], 0, 0
 
 
+def page_bounds(page):
+    # Text/drawing extraction uses unrotated coordinates; page.rect includes /Rotate.
+    return page.rect * page.derotation_matrix
+
+
 def check_pdf(pdf: pathlib.Path, rep: Report, declared: set[str], expect_pages: int | None):
     doc = fitz.open(pdf)
     if expect_pages and len(doc) != expect_pages:
@@ -125,7 +131,7 @@ def check_pdf(pdf: pathlib.Path, rep: Report, declared: set[str], expect_pages: 
     body = max(set(body_size), key=body_size.count) if body_size else 10
 
     for i, p in enumerate(doc, 1):
-        W, H = p.rect.width, p.rect.height
+        W, H = page_bounds(p).width, page_bounds(p).height
         d = p.get_text("dict")
         txt = p.get_text()
         check_overprint(p, i, rep)
@@ -141,8 +147,8 @@ def check_pdf(pdf: pathlib.Path, rep: Report, declared: set[str], expect_pages: 
                 kind = "image" if b["type"] == 1 else "text"
                 rep.err(f"p{i}: {kind} block outside page bbox={tuple(round(v) for v in b['bbox'])}")
         for (x0, y0, x1, y1) in [r["rect"] for r in p.get_drawings() if r.get("rect")]:
-            if x1 > W + MARGIN_TOL or x0 < -MARGIN_TOL:
-                rep.err(f"p{i}: drawing (table border?) wider than page x={round(x0)}..{round(x1)}")
+            if x1 > W + MARGIN_TOL or x0 < -MARGIN_TOL or y0 < -MARGIN_TOL or y1 > H + MARGIN_TOL:
+                rep.err(f"p{i}: drawing (table border?) outside page bbox={(round(x0), round(y0), round(x1), round(y1))}")
                 break
         # Stranded heading: last text line on the page is larger/bolder than body, with more pages after.
         lines = [ln for b in d["blocks"] for ln in b.get("lines", []) if any(s["text"].strip() for s in ln["spans"])]
@@ -154,28 +160,28 @@ def check_pdf(pdf: pathlib.Path, rep: Report, declared: set[str], expect_pages: 
                          f"(set keep-with-next / break-after: avoid)")
     for i in range(len(doc) - 1):  # big hole mid-document: stale forced page break / kept block jumped
         p = doc[i]
-        ys = [b["bbox"][3] for b in p.get_text("dict")["blocks"] if b["bbox"][3] < p.rect.height * 0.9]
-        if ys and max(ys) < p.rect.height * 0.55 and i > 0:
-            rep.warn(f"p{i+1}: content ends at {max(ys)/p.rect.height:.0%} of the page — check for a stale "
+        ys = [b["bbox"][3] for b in p.get_text("dict")["blocks"] if b["bbox"][3] < page_bounds(p).height * 0.9]
+        if ys and max(ys) < page_bounds(p).height * 0.55 and i > 0:
+            rep.warn(f"p{i+1}: content ends at {max(ys)/page_bounds(p).height:.0%} of the page — check for a stale "
                      f"page break or a table/figure that jumped to the next page")
     if len(doc) > 1:
         last = doc[-1]
         ys = [b["bbox"][3] for b in last.get_text("dict")["blocks"]]
-        if ys and max(ys) < last.rect.height * 0.15:
-            rep.warn(f"last page is almost empty (content ends at {max(ys)/last.rect.height:.0%}) — tighten or pad")
+        if ys and max(ys) < page_bounds(last).height * 0.15:
+            rep.warn(f"last page is almost empty (content ends at {max(ys)/page_bounds(last).height:.0%}) — tighten or pad")
     check_table_splits(doc, rep)
     # Per-document right edge overflow beyond the body column (e.g. a too-wide table)
     l, r, _, _ = text_margins(doc)
     for i, p in enumerate(doc, 1):
         for b in p.get_text("dict")["blocks"]:
-            if b["type"] == 0 and b["bbox"][2] > r + 36 and b["bbox"][2] > p.rect.width - 20:
+            if b["type"] == 0 and b["bbox"][2] > r + 36 and b["bbox"][2] > page_bounds(p).width - 20:
                 rep.err(f"p{i}: text runs into right page edge (x1={round(b['bbox'][2])}, column ends ~{round(r)})")
     doc.close()
 
 
 def table_rows(page):
     """Visual rows in the content zone: [(cells_count, text)], cells = lines sharing a baseline."""
-    H = page.rect.height
+    H = page_bounds(page).height
     lines = sorted(((ln["bbox"][3], ln["bbox"][0], "".join(s["text"] for s in ln["spans"]).strip())
                     for b in page.get_text("dict")["blocks"] for ln in b.get("lines", [])
                     if H * 0.07 < ln["bbox"][3] < H * 0.93), key=lambda x: x[0])
@@ -230,10 +236,15 @@ def check_table_splits(doc, rep: Report, min_rows=3):
         idx = [k for k, r in enumerate(cur) if r[1] == head]
         if not idx:
             continue
-        after = 0
+        after, wrapped_lines = 0, 0
         for r in cur[idx[-1] + 1:]:
             if r[0] < 2:
-                break
+                # Wrapped headers/cell text produce single-cell baselines between rows.
+                wrapped_lines += 1
+                if wrapped_lines > 4:
+                    break
+                continue
+            wrapped_lines = 0
             after += 1
         if after < min_rows:
             rep.err(f"p{i+1}: table starts at the page bottom with only {after} row(s) before the break "
@@ -268,10 +279,14 @@ def check_edit(new_pdf, old_pdf, rep: Report, allow_reflow: bool):
                     f"p{i+1}: text identical but layout moved ({px:.2%} pixels) — unintended reflow/format change")
     print(f"pages with text changes: {changed or 'none'}")
     old, new = " ".join(to), " ".join(tn)
-    sm = difflib.SequenceMatcher(None, old.split(" "), new.split(" "), autojunk=False)
+    old_words, new_words = old.split(" "), new.split(" ")
+    # Repeated boilerplate makes an exact global word diff quadratic on long reports.
+    # This diff is diagnostic only; page text and pixel checks above remain exact.
+    sm = difflib.SequenceMatcher(None, old_words, new_words,
+                                 autojunk=max(len(old_words), len(new_words)) > 5000)
     for op, a0, a1, b0, b1 in sm.get_opcodes():
         if op != "equal":
-            print(f"  {op}: {' '.join(old.split(' ')[a0:a1])[:120]!r} -> {' '.join(new.split(' ')[b0:b1])[:120]!r}")
+            print(f"  {op}: {' '.join(old_words[a0:a1])[:120]!r} -> {' '.join(new_words[b0:b1])[:120]!r}")
 
 
 def main():
@@ -293,7 +308,7 @@ def main():
             rep.err("document has a TOC field but the rendered TOC is empty (fields not updated)")
     if a.original:
         o = pathlib.Path(a.original)
-        opdf, _ = render(o, ROOT / "out" / "qa" / "orig" / o.name)
+        opdf, _ = render(o, ROOT / "out" / "qa" / "orig" / o.name / uuid.uuid4().hex)
         # Defects already in the original are not the edit's fault: report, don't block.
         orep = Report()
         check_pdf(opdf, orep, docx_fonts(o), None)

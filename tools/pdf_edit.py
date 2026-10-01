@@ -11,6 +11,7 @@ would break the layout. Use a shorter wording or regenerate the PDF.
 """
 import argparse
 import pathlib
+import re
 import sys
 
 from safe_output import staged_output
@@ -29,13 +30,21 @@ def span_at(page, rect):
     return best
 
 
+def font_name(name):
+    return re.sub(r"[^a-z0-9]", "", name.split("+")[-1].lower())
+
+
 def font_for(doc, page, span):
     for xref, ext, _, name, *_ in page.get_fonts(full=True):
-        if name.split("+")[-1] == span["font"].split("+")[-1] or name == span["font"]:
+        if font_name(name) == font_name(span["font"]):
             _, ext, _, buf = doc.extract_font(xref)
             if buf and ext not in ("n/a", ""):
                 return fitz.Font(fontbuffer=buf), buf
     return None, None
+
+
+def link_key(link):
+    return (link.get("kind"), tuple(round(v, 3) for v in link["from"]), link.get("uri"), link.get("page"), str(link.get("to")), link.get("file"), link.get("nameddest"))
 
 
 def main():
@@ -51,6 +60,8 @@ def main():
         sys.exit("refusing to overwrite the original")
     if a.count < 1 or any(not old.strip() for old, _ in a.replace):
         sys.exit("ERROR count must be positive and search text nonempty")
+    if any(any(c in text for c in "\n\r\t") for pair in a.replace for text in pair):
+        sys.exit("ERROR text replacement is single-line; tabs and line breaks are unsupported")
     doc = fitz.open(a.src)
     plan, errors = [], []
     for old, new in a.replace:
@@ -62,6 +73,9 @@ def main():
         for page, rect in hits:
             if page.rotation:
                 errors.append("rotated pages: edit the source instead")
+                continue
+            if any(rect.intersects(widget.rect) for widget in page.widgets() or []):
+                errors.append(f"{old!r}: text overlaps an interactive form field; edit the field value instead")
                 continue
             s = span_at(page, rect)
             lines = [ln for b in page.get_text("dict")["blocks"] for ln in b.get("lines", []) if any(fitz.Rect(sp["bbox"]).intersects(rect) for sp in ln["spans"])]
@@ -84,20 +98,34 @@ def main():
             if w_new > rect.width * 1.03:
                 errors.append(f"{old!r} p{page.number+1}: new text {w_new:.1f}pt wider than old {rect.width:.1f}pt — would overflow")
                 continue
-            plan.append((page, rect, s, buf, new, sw))
-    for i, (page, rect, *_) in enumerate(plan):
-        if any(page.number == other.number and rect.intersects(r) for other, r, *_ in plan[:i]):
+            plan.append((page.number, rect, s, buf, new, sw))
+    for i, (number, rect, *_) in enumerate(plan):
+        if any(number == other and rect.intersects(r) for other, r, *_ in plan[:i]):
             errors.append("overlapping replacement targets")
     if errors:
         print("\n".join("ERROR " + e for e in errors))
         sys.exit(1)
     if a.dry_run:
         return
-    for page, rect, *_ in plan:
-        page.add_redact_annot(rect + (1, 1, -1, -1), fill=False)  # shrink: don't eat neighbour glyphs
-    for page in {p for p, *_ in plan}:
+    links = {number: doc[number].get_links() for number, *_ in plan}
+    for number, rect, *_ in plan:
+        doc[number].add_redact_annot(rect + (1, 1, -1, -1), fill=False)  # shrink: don't eat neighbour glyphs
+    for number in {n for n, *_ in plan}:
+        page = doc[number]
         page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE, graphics=fitz.PDF_REDACT_LINE_ART_NONE)
-    for i, (page, rect, s, buf, new, sw) in enumerate(plan):
+    # Redaction invalidates PyMuPDF link caches; reopen the in-memory PDF before restoring links.
+    if any(links.values()):
+        refreshed = fitz.open(stream=doc.tobytes(), filetype="pdf")
+        doc.close()
+        doc = refreshed
+    for number in links:
+        page = doc[number]
+        current = {link_key(link) for link in page.get_links()}
+        for link in links[page.number]:
+            if link_key(link) not in current:
+                page.insert_link({key: value for key, value in link.items() if key not in ("xref", "id")})
+    for i, (number, rect, s, buf, new, sw) in enumerate(plan):
+        page = doc[number]
         name = f"edit{i}"
         page.insert_font(fontname=name, fontbuffer=buf)
         c = s["color"]
@@ -113,6 +141,10 @@ def main():
         with fitz.open(temp) as chk:
             if len(chk) != len(doc):
                 sys.exit("ERROR page count changed")
+            for number, original_links in links.items():
+                actual = {link_key(link) for link in chk[number].get_links()}
+                if any(link_key(link) not in actual for link in original_links):
+                    sys.exit("ERROR hyperlink preservation failed")
             for old, new in a.replace:
                 if old not in new and any(p.search_for(old) for p in chk):
                     sys.exit(f"ERROR old text still extractable: {old!r}")
@@ -123,4 +155,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except (OSError, ValueError, RuntimeError) as exc:
+        print(f"ERROR {exc}; nothing published")
+        sys.exit(1)

@@ -1,9 +1,9 @@
-"""Render a document to PDF + PNG pages + one contact sheet for visual QA.
+"""Render a document to PDF + PNG pages + contact sheets for visual QA.
 
     python tools/render.py FILE [--dpi 110] [--out out/render/<name>]
 
 FILE: .docx .doc .odt .rtf (LibreOffice) | .typ (Typst) | .html (WeasyPrint) | .pdf
-Prints the paths of the PDF, the page PNGs and sheet.png (all pages on one image).
+Prints the paths of the PDF, the page PNGs and sheet.png (all pages in sheets of at most 24).
 """
 import argparse
 import os
@@ -61,6 +61,8 @@ def to_pdf(src: pathlib.Path, out: pathlib.Path) -> pathlib.Path:
 def to_png(pdf: pathlib.Path, out: pathlib.Path, dpi: int) -> list[pathlib.Path]:
     for old in out.glob("page-*.png"):
         old.unlink()
+    for old in out.glob("sheet-*.png"):
+        old.unlink()
     pages = []
     with fitz.open(pdf) as doc:
         for i, page in enumerate(doc, 1):
@@ -68,13 +70,17 @@ def to_png(pdf: pathlib.Path, out: pathlib.Path, dpi: int) -> list[pathlib.Path]
             page.get_pixmap(dpi=dpi).save(p)
             pages.append(p)
         sheet(doc, out / "sheet.png")
+        for start in range(24, len(doc), 24):
+            sheet(doc, out / f"sheet-{start // 24 + 1:03}.png", start_page=start)
     return pages
 
 
-def sheet(doc, path: pathlib.Path, cols: int = 4, max_pages: int = 24) -> None:
+def sheet(doc, path: pathlib.Path, cols: int = 4, max_pages: int = 24, start_page: int = 0) -> None:
     """All pages as thumbnails on one image: fastest way to eyeball rhythm and stray pages."""
-    n = min(len(doc), max_pages)
-    w, h = doc[0].rect.width, doc[0].rect.height
+    n = min(len(doc) - start_page, max_pages)
+    if n <= 0:
+        raise ValueError("no pages for contact sheet")
+    w, h = doc[start_page].rect.width, doc[start_page].rect.height
     gap, rows = 12, (n + cols - 1) // cols
     cw = min(cols, n)
     out = fitz.open()
@@ -85,9 +91,12 @@ def sheet(doc, path: pathlib.Path, cols: int = 4, max_pages: int = 24) -> None:
         rect = fitz.Rect(gap + c * (w + gap), gap + r * (h + gap), 0, 0)
         rect.x1, rect.y1 = rect.x0 + w, rect.y0 + h
         pg.draw_rect(rect, color=None, fill=(1, 1, 1))
-        if doc[i].get_contents():
-            pg.show_pdf_page(rect, doc, i, rotate=-doc[i].rotation)
+        if doc[start_page + i].get_contents():
+            # Use the actual page raster: show_pdf_page clips rotated/cropped pages
+            # and omits annotations. A contact sheet must match the page PNG.
+            pg.insert_image(rect, pixmap=doc[start_page + i].get_pixmap(dpi=50, alpha=False))
     pg.get_pixmap(dpi=36 if n > 8 else 50).save(path)
+    out.close()
 
 
 def render(src, out=None, dpi=110):
@@ -115,4 +124,6 @@ if __name__ == "__main__":
     ap.add_argument("--out")
     a = ap.parse_args()
     pdf, pages = render(a.file, a.out, a.dpi)
+    if len(pages) > 24:
+        print(f"contact sheets: {(len(pages) + 23) // 24}; inspect sheet.png and sheet-*.png")
     print(f"pdf:   {pdf}\nsheet: {pdf.parent / 'sheet.png'}\npages: {len(pages)} in {pdf.parent}")
