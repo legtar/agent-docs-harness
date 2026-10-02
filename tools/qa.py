@@ -21,9 +21,10 @@ import sys
 import uuid
 import zipfile
 
-import fitz
+import pymupdf as fitz
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
+import host  # noqa: E402
 from render import ROOT, render  # noqa: E402
 
 PLACEHOLDERS = re.compile(
@@ -40,14 +41,44 @@ class Report:
     def warn(self, m): self.warns.append(m)
 
 
+def main_part(z: zipfile.ZipFile) -> str:
+    """Package path of the document part (usually word/document.xml, but not always)."""
+    name = "word/document.xml"
+    try:
+        for rel in re.findall(r"<Relationship\b[^>]*>", z.read("_rels/.rels").decode("utf8", "ignore")):
+            target = re.search(r'Target="/?([^"]+)"', rel)
+            if "/officeDocument\"" in rel and target:
+                name = target.group(1)
+    except KeyError:
+        pass
+    return name if name in z.namelist() else "word/document.xml"
+
+
+def check_toc(src: pathlib.Path, pdf: pathlib.Path, rep: Report):
+    """A TOC field must come out filled in the render (fields updated)."""
+    if src.suffix.lower() != ".docx":
+        return
+    with zipfile.ZipFile(src) as z:
+        try:
+            xml = z.read(main_part(z)).decode("utf8", "ignore")
+        except KeyError:
+            return
+    if re.search(r"TOC\s+\\o", xml):
+        with fitz.open(pdf) as d:
+            head = "\n".join(d[i].get_text() for i in range(min(3, len(d))))
+        if len(re.findall(r"\.{5,}\s*\d+\s*$", head, re.M)) < 2:
+            rep.err("document has a TOC field but the rendered TOC is empty (fields not updated)")
+
+
 def docx_fonts(path: pathlib.Path) -> set[str]:
     """Latin fonts the docx asks for (styles, theme, runs). Used to detect silent substitution."""
     if path.suffix.lower() != ".docx":
         return set()
     fonts = set()
     with zipfile.ZipFile(path) as z:
+        main = main_part(z)
         for name in z.namelist():
-            if name in ("word/document.xml", "word/styles.xml") or name.startswith(("word/header", "word/footer")):
+            if name in (main, "word/styles.xml") or name.startswith(("word/header", "word/footer")):
                 fonts |= set(re.findall(r'w:(?:ascii|hAnsi|cs)="([^"]+)"', z.read(name).decode("utf8", "ignore")))
             elif name.startswith("word/theme/"):
                 xml = z.read(name).decode("utf8", "ignore")
@@ -58,24 +89,9 @@ def docx_fonts(path: pathlib.Path) -> set[str]:
 FALLBACKS = ("dejavu", "liberation", "opensymbol", "notosans", "notoserif", "carlito", "caladea")
 
 
-def installed_fonts() -> set[str]:
-    """Normalised family names registered in Windows (machine + per-user). Empty off Windows."""
-    try:
-        import winreg
-    except ImportError:
-        return set()
-    names = set()
-    for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
-        try:
-            k = winreg.OpenKey(hive, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts")
-        except OSError:
-            continue
-        for i in range(winreg.QueryInfoKey(k)[1]):
-            n = winreg.EnumValue(k, i)[0]
-            for part in re.sub(r"\s*\((TrueType|OpenType)\)", "", n).split(" & "):
-                fam = re.sub(r"\s+(Bold|Italic|Light|Semibold|SemiBold|Black|Regular|Medium|Thin)\b.*", "", part)
-                names.add(re.sub(r"[^a-z0-9]", "", fam.lower()))
-    return names
+def installed_fonts():
+    """Normalised family names available on this machine (Windows registry, fontconfig, font folders)."""
+    return host.installed_fonts()
 
 
 def norm(name: str) -> str:
@@ -301,17 +317,14 @@ def main():
     rep = Report()
     pdf, pages = render(src, ROOT / "out" / "qa" / "new" / src.name)
     check_pdf(pdf, rep, docx_fonts(src), a.pages)
-    if src.suffix.lower() == ".docx" and re.search(r"TOC\s+\\o", zipfile.ZipFile(src).read("word/document.xml").decode("utf8", "ignore")):
-        with fitz.open(pdf) as d:
-            head = "\n".join(d[i].get_text() for i in range(min(3, len(d))))
-        if len(re.findall(r"\.{5,}\s*\d+\s*$", head, re.M)) < 2:
-            rep.err("document has a TOC field but the rendered TOC is empty (fields not updated)")
+    check_toc(src, pdf, rep)
     if a.original:
         o = pathlib.Path(a.original)
         opdf, _ = render(o, ROOT / "out" / "qa" / "orig" / o.name / uuid.uuid4().hex)
         # Defects already in the original are not the edit's fault: report, don't block.
         orep = Report()
         check_pdf(opdf, orep, docx_fonts(o), None)
+        check_toc(o, opdf, orep)
         old = set(orep.errors)
         for e in [e for e in rep.errors if e in old]:
             rep.errors.remove(e)

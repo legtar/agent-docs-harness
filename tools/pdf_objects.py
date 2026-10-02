@@ -8,7 +8,7 @@ import json
 import math
 import pathlib
 import sys
-import fitz
+import pymupdf as fitz
 from safe_output import staged_output
 
 

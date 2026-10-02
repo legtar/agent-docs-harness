@@ -15,7 +15,7 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "tools"))
 from docx import Document  # noqa: E402
 from docx_kit import md_to_docx  # noqa: E402
-import fitz  # noqa: E402
+import pymupdf as fitz
 
 OUT = ROOT / "out" / "validation"
 OUT.mkdir(parents=True, exist_ok=True)

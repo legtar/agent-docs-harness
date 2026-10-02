@@ -8,7 +8,7 @@ import subprocess
 import json
 from unittest.mock import patch
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "tools"))
-import fitz
+import pymupdf as fitz
 from docx import Document
 from docx.shared import Cm
 from lxml import etree
@@ -134,11 +134,11 @@ class Regression(unittest.TestCase):
         page.insert_text((50, 80), "Ivanov Ivanovich", fontsize=12)  # embeds a Latin-only subset
         doc.save(src, garbage=4, deflate=True); doc.close()
         r = subprocess.run([sys.executable, str(ROOT/"tools/pdf_edit.py"), str(src), str(dst),
-                            "--replace", "Ivanov Ivanovich", "Халикова Галия"], capture_output=True, text=True)
+                            "--replace", "Ivanov Ivanovich", "Иванов Иван"], capture_output=True, text=True)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("system:", r.stdout)  # the subset could not be used, the system family was
         with fitz.open(dst) as d:
-            self.assertIn("Халикова Галия", d[0].get_text())
+            self.assertIn("Иванов Иван", d[0].get_text())
 
     def test_pdf_replace_grows_right_aligned_text_leftwards(self):
         """A wider number may grow into the free space left of a right-aligned column edge."""

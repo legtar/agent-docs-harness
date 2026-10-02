@@ -13,19 +13,14 @@ import subprocess
 import sys
 import tempfile
 
-import fitz  # PyMuPDF
+import pymupdf as fitz
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 FONTS = ROOT / "fonts"
 
 
-def soffice() -> str:
-    for c in (shutil.which("soffice"),
-              r"C:\Program Files\LibreOffice\program\soffice.exe",
-              r"C:\Program Files (x86)\LibreOffice\program\soffice.exe"):
-        if c and os.path.exists(c):
-            return c
-    sys.exit("LibreOffice not found: winget install -e --id TheDocumentFoundation.LibreOffice")
+sys.path.insert(0, str(pathlib.Path(__file__).parent))
+from host import lo_python, soffice  # noqa: E402  (LibreOffice lookup for Windows, macOS, Linux)
 
 
 def to_pdf(src: pathlib.Path, out: pathlib.Path) -> pathlib.Path:
@@ -40,10 +35,10 @@ def to_pdf(src: pathlib.Path, out: pathlib.Path) -> pathlib.Path:
     elif ext in (".html", ".htm"):
         from weasyprint import HTML
         HTML(filename=str(src)).write_pdf(str(pdf))
-    elif ext in (".docx", ".odt", ".doc", ".rtf") and (lo_py := pathlib.Path(soffice()).parent / "python.exe").exists():
+    elif ext in (".docx", ".odt", ".doc", ".rtf") and (lo_py := lo_python()):
         # UNO path: refreshes TOC/fields before export, like Word does on open.
         with tempfile.TemporaryDirectory(prefix="lo_profile_", ignore_cleanup_errors=True) as prof:
-            subprocess.run([str(lo_py), str(pathlib.Path(__file__).with_name("lo_export.py")), str(src), str(pdf), prof],
+            subprocess.run([lo_py, str(pathlib.Path(__file__).with_name("lo_export.py")), str(src), str(pdf), prof, soffice()],
                            check=True, capture_output=True, timeout=300)
     elif ext in (".docx", ".odt", ".doc", ".rtf"):
         # Isolated profile: parallel soffice runs otherwise fight over the user profile lock.
@@ -56,6 +51,34 @@ def to_pdf(src: pathlib.Path, out: pathlib.Path) -> pathlib.Path:
     if not pdf.exists():
         sys.exit(f"render failed: {pdf} not produced")
     return pdf
+
+
+def to_docx(src: pathlib.Path, out: pathlib.Path) -> pathlib.Path:
+    """Make an editable .docx: .doc / .rtf / .odt through LibreOffice (faithful), .pdf through
+    pdf2docx (a reconstruction — fonts, lists and page furniture are approximated; compare!)."""
+    out.mkdir(parents=True, exist_ok=True)
+    dst = out / (src.stem + ".docx")
+    ext = src.suffix.lower()
+    if ext == ".pdf":
+        try:
+            from pdf2docx import Converter
+        except ImportError:
+            sys.exit("PDF -> DOCX needs: pip install pdf2docx   (lossy; prefer tools/pdf_flow.py for in-place edits)")
+        cv = Converter(str(src))
+        try:
+            cv.convert(str(dst))
+        finally:
+            cv.close()
+    elif ext in (".doc", ".rtf", ".odt", ".dotx", ".docm"):
+        with tempfile.TemporaryDirectory(prefix="lo_profile_", ignore_cleanup_errors=True) as prof:
+            subprocess.run([soffice(), f"-env:UserInstallation={pathlib.Path(prof).as_uri()}", "--headless",
+                            "--convert-to", "docx:MS Word 2007 XML", "--outdir", str(out), str(src)],
+                           check=True, capture_output=True, timeout=300)
+    else:
+        raise ValueError(f"cannot convert {ext} to .docx")
+    if not dst.exists():
+        sys.exit(f"conversion failed: {dst} not produced")
+    return dst
 
 
 def to_png(pdf: pathlib.Path, out: pathlib.Path, dpi: int) -> list[pathlib.Path]:
@@ -122,7 +145,13 @@ if __name__ == "__main__":
     ap.add_argument("file")
     ap.add_argument("--dpi", type=int, default=110)
     ap.add_argument("--out")
+    ap.add_argument("--to-docx", action="store_true",
+                    help="convert .doc/.rtf/.odt (or, lossy, .pdf) to an editable .docx instead of rendering")
     a = ap.parse_args()
+    if a.to_docx:
+        src = pathlib.Path(a.file).resolve()
+        print(f"docx:  {to_docx(src, pathlib.Path(a.out).resolve() if a.out else ROOT / 'out' / 'converted')}")
+        sys.exit(0)
     pdf, pages = render(a.file, a.out, a.dpi)
     if len(pages) > 24:
         print(f"contact sheets: {(len(pages) + 23) // 24}; inspect sheet.png and sheet-*.png")

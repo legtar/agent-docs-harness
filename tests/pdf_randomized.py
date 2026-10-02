@@ -1,6 +1,6 @@
 """Seeded PDF page/object edits with independent post-save assertions."""
 import pathlib, random, sys, hashlib
-import fitz
+import pymupdf as fitz
 sys.path.insert(0,str(pathlib.Path(__file__).resolve().parents[1]/'tools'))
 from pdf_objects import apply_ops
 from safe_output import staged_output

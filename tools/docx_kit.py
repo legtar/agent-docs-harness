@@ -42,12 +42,8 @@ TOKENS = {
 NUM = re.compile(r"^[\s+\-−–]?[\d\s\u00a0.,]+\s*(%|‰|₽|\$|€|п\.п\.|млн|млрд|тыс\.?)?$")
 
 
-def pandoc() -> str:
-    for c in (shutil.which("pandoc"), pathlib.Path.home() / "AppData/Local/Pandoc/pandoc.exe",
-              pathlib.Path("C:/Program Files/Pandoc/pandoc.exe")):
-        if c and pathlib.Path(c).exists():
-            return str(c)
-    sys.exit("pandoc not found: winget install -e --id JohnMacFarlane.Pandoc")
+sys.path.insert(0, str(pathlib.Path(__file__).parent))
+from host import pandoc  # noqa: E402  (pandoc lookup for Windows, macOS, Linux)
 
 
 # ---------- low-level OOXML helpers ----------

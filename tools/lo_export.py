@@ -1,7 +1,7 @@
 """DOCX/ODT -> PDF through LibreOffice UNO, refreshing TOC/indexes and fields first
 (plain `soffice --convert-to pdf` leaves a TOC empty). Runs under LibreOffice's own python:
 
-    "C:/Program Files/LibreOffice/program/python.exe" tools/lo_export.py IN OUT.pdf PROFILE_DIR
+    <LibreOffice python> tools/lo_export.py IN OUT.pdf PROFILE_DIR [SOFFICE]
 
 Used by render.py; not meant to be called directly.
 """
@@ -20,8 +20,9 @@ def prop(n, v):
     return p
 
 
-def main(src, dst, profile):
-    office = pathlib.Path(sys.executable).parent / "soffice.exe"
+def main(src, dst, profile, office=None):
+    # render.py passes the soffice path; the fallback covers a direct call on Windows
+    office = office or pathlib.Path(sys.executable).parent / "soffice.exe"
     pipe = f"lo_export_{uuid.uuid4().hex}"
     proc = subprocess.Popen([str(office), f"-env:UserInstallation={pathlib.Path(profile).as_uri()}",
                              "--headless", "--invisible", "--norestore", "--nologo",
@@ -73,4 +74,4 @@ def main(src, dst, profile):
 
 
 if __name__ == "__main__":
-    main(*sys.argv[1:4])
+    main(*sys.argv[1:5])

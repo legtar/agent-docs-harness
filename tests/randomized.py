@@ -10,7 +10,7 @@ import random
 import subprocess
 import sys
 import zipfile
-import fitz
+import pymupdf as fitz
 from docx import Document
 from docx.shared import Cm, Pt
 ROOT = pathlib.Path(__file__).resolve().parents[1]

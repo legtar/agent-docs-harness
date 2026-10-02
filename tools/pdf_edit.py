@@ -21,9 +21,11 @@ import pathlib
 import re
 import sys
 
-from safe_output import staged_output
+sys.path.insert(0, str(pathlib.Path(__file__).parent))
+import host  # noqa: E402
+from safe_output import staged_output  # noqa: E402
 
-import fitz
+import pymupdf as fitz
 
 
 def span_at(page, rect):
@@ -55,31 +57,41 @@ SYSTEM_FAMILIES = {
     "tahoma": ["tahoma.ttf", "tahomabd.ttf", "tahomai.ttf", "tahomaz.ttf"],
     "segoeui": ["segoeui.ttf", "segoeuib.ttf", "segoeuii.ttf", "segoeuiz.ttf"],
 }
-SYSTEM_FONT_DIRS = [pathlib.Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts", pathlib.Path.home() / "AppData/Local/Microsoft/Windows/Fonts"]
+SYSTEM_FONT_DIRS = host.font_dirs()
+
+
+def span_style(span):
+    name = span["font"].lower()
+    return (bool(span["flags"] & (1 << 4)) or "bold" in name,
+            bool(span["flags"] & (1 << 1)) or "italic" in name or "oblique" in name)
+
+
+def indexed_font(span, needed):
+    """Same family and style among the fonts shipped in fonts/ and every installed font file
+    (any family, any OS) — used when the fixed Windows table below has no answer."""
+    path = host.find_font(span["font"], *span_style(span))
+    if path is None:
+        return None, None
+    font = fitz.Font(fontfile=str(path))
+    if all(font.has_glyph(ord(c)) for c in needed if c.strip()):
+        return font, font.buffer
+    return None, None
 
 
 def system_font(span, needed):
-    """Regular/italic/bold/bold-italic file of the span's family from the system fonts."""
-    files = SYSTEM_FAMILIES.get(font_name(span["font"]))
-    if not files:
-        return None, None
-    flags = bool(span["flags"]) & (1 << 4)  # bold
-    italic = "Italic" in span["font"] or "Oblique" in span["font"] or (bool(span["flags"]) & (1 << 1))
-    order = ["arialbd.ttf" if flags else "arial.ttf", "arialbi.ttf" if flags and italic else "ariali.ttf" if italic else "arial.ttf"]
-    order += files
-    seen = set()
-    for name in order:
-        if name in seen:
-            continue
-        seen.add(name)
+    """The span's own family in the span's own style (regular / bold / italic / bold italic) from
+    the system fonts. Never another family: a look-alike changes widths and the look of the page."""
+    files = SYSTEM_FAMILIES.get(host.pdf_family(span["font"]))
+    if files:
+        bold, italic = span_style(span)
+        name = files[(1 if bold else 0) + (2 if italic else 0)]
         for folder in SYSTEM_FONT_DIRS:
             path = folder / name
-            if not path.exists():
-                continue
-            font = fitz.Font(fontfile=str(path))
-            if all(font.has_glyph(ord(c)) for c in needed if c.strip()):
-                return font, font.buffer
-    return None, None
+            if path.exists():
+                font = fitz.Font(fontfile=str(path))
+                if all(font.has_glyph(ord(c)) for c in needed if c.strip()):
+                    return font, font.buffer
+    return indexed_font(span, needed)
 
 
 def embedded_font(doc, page, span, needed):

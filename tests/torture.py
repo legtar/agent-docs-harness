@@ -4,7 +4,7 @@ from lxml import etree
 from docx import Document
 from docx.oxml import OxmlElement
 from docx.shared import Cm
-import fitz
+import pymupdf as fitz
 ROOT=pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT/'tools'))
 import docx_edit as de
@@ -79,15 +79,19 @@ class Torture(unittest.TestCase):
         p=xml('<w:ins w:id="1" w:author="Original"><w:r><w:t>old</w:t></w:r></w:ins>')
         with self.assertRaises(OpError): replace(p,'old','new',Editor('Second'))
 
-    def test_vml_row_clone_refuses_duplicate_objects(self):
+    def test_vml_row_clone_never_duplicates_objects(self):
         d=Document(); t=d.add_table(rows=1,cols=1);t.cell(0,0).text='text'
         t.cell(0,0).paragraphs[0].add_run()._r.append(OxmlElement('w:pict'))
-        with self.assertRaises(OpError): de.add_row(t._tbl,0,['new'],Editor())
+        row=de.add_row(t._tbl,0,['new'],Editor())
+        self.assertEqual(len(list(t._tbl.iter(q('pict')))),1)  # the object stays only in the source row
+        self.assertEqual(de.cell_text(de.row_cells(row)[0]),'new')
 
-    def test_row_clone_refuses_duplicate_footnote(self):
+    def test_row_clone_never_duplicates_footnote(self):
         d=Document();t=d.add_table(rows=1,cols=1);t.cell(0,0).text='text'
         note=OxmlElement('w:footnoteReference');note.set(q('id'),'1');t.cell(0,0).paragraphs[0].add_run()._r.append(note)
-        with self.assertRaises(OpError): de.add_row(t._tbl,0,['new'],Editor())
+        row=de.add_row(t._tbl,0,['new'],Editor())
+        self.assertEqual(len(list(t._tbl.iter(q('footnoteReference')))),1)
+        self.assertEqual(de.cell_text(de.row_cells(row)[0]),'new')
 
     def test_insert_into_vertical_merge_refuses_breaking_chain(self):
         d=Document();t=d.add_table(rows=3,cols=2);t.cell(0,0).merge(t.cell(2,0)).text='Merged'
